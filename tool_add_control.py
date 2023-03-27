@@ -26,7 +26,15 @@ def get_node_name(name, parent_name):
 
 model = create_model(config_path='./models/cldm_v15.yaml')
 
-pretrained_weights = torch.load(input_path)
+if 'safetensor' in input_path:
+    from safetensors import safe_open
+    pretrained_weights = dict()
+    with safe_open(input_path, framework="pt", device="cpu") as file:
+        for k in file.keys():
+            pretrained_weights[k] = file.get_tensor(k)
+else:
+    pretrained_weights = torch.load(input_path)
+
 if 'state_dict' in pretrained_weights:
     pretrained_weights = pretrained_weights['state_dict']
 

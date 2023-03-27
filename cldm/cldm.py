@@ -20,7 +20,9 @@ from ldm.models.diffusion.ddim import DDIMSampler
 
 
 class ControlledUnetModel(UNetModel):
-    def forward(self, x, timesteps=None, context=None, control=None, only_mid_control=False, **kwargs):
+    def forward(self, x, timesteps=None, context=None, control=None, only_mid_control=False, no_control=False, **kwargs):
+        # import ipdb
+        # ipdb.set_trace()
         hs = []
         with torch.no_grad():
             t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
@@ -31,10 +33,11 @@ class ControlledUnetModel(UNetModel):
                 hs.append(h)
             h = self.middle_block(h, emb, context)
 
-        h += control.pop()
+        if not no_control:
+            h += control.pop()
 
         for i, module in enumerate(self.output_blocks):
-            if only_mid_control:
+            if only_mid_control or no_control:
                 h = torch.cat([h, hs.pop()], dim=1)
             else:
                 h = torch.cat([h, hs.pop() + control.pop()], dim=1)
@@ -277,6 +280,9 @@ class ControlNet(nn.Module):
         self.middle_block_out = self.make_zero_conv(ch)
         self._feature_size += ch
 
+        if use_fp16:
+            self.to(self.dtype)
+
     def make_zero_conv(self, channels):
         return TimestepEmbedSequential(zero_module(conv_nd(self.dims, channels, channels, 1, padding=0)))
 
@@ -308,7 +314,10 @@ class ControlLDM(LatentDiffusion):
 
     def __init__(self, control_stage_config, control_key, only_mid_control, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.control_model = instantiate_from_config(control_stage_config)
+        if control_stage_config is not None and control_stage_config != 'None':
+            self.control_model = instantiate_from_config(control_stage_config)
+        else:
+            self.control_model = None
         self.control_key = control_key
         self.only_mid_control = only_mid_control
 
@@ -323,15 +332,19 @@ class ControlLDM(LatentDiffusion):
         control = control.to(memory_format=torch.contiguous_format).float()
         return x, dict(c_crossattn=[c], c_concat=[control])
 
-    def apply_model(self, x_noisy, t, cond, *args, **kwargs):
+    def apply_model(self, x_noisy, t, cond, control=None, no_control=False, *args, **kwargs):
         assert isinstance(cond, dict)
         diffusion_model = self.model.diffusion_model
         cond_txt = torch.cat(cond['c_crossattn'], 1)
-        cond_hint = torch.cat(cond['c_concat'], 1)
 
-        control = self.control_model(x=x_noisy, hint=cond_hint, timesteps=t, context=cond_txt)
-        eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control)
+        # NOTE: we support pass control
+        if control is None and not no_control:
+            cond_hint = torch.cat(cond['c_concat'], 1)
+            control = self.control_model(x=x_noisy, hint=cond_hint, timesteps=t, context=cond_txt)
 
+        eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control, no_control=no_control)
+        # import ipdb
+        # ipdb.set_trace()
         return eps
 
     @torch.no_grad()
@@ -408,12 +421,14 @@ class ControlLDM(LatentDiffusion):
         return samples, intermediates
 
     def configure_optimizers(self):
+        # import ipdb
         lr = self.learning_rate
         params = list(self.control_model.parameters())
         if not self.sd_locked:
             params += list(self.model.diffusion_model.output_blocks.parameters())
             params += list(self.model.diffusion_model.out.parameters())
         opt = torch.optim.AdamW(params, lr=lr)
+        # ipdb.set_trace()
         return opt
 
     def low_vram_shift(self, is_diffusing):

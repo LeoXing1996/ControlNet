@@ -8,11 +8,19 @@ from ldm.modules.diffusionmodules.util import make_ddim_sampling_parameters, mak
 
 
 class DDIMSampler(object):
-    def __init__(self, model, schedule="linear", **kwargs):
+    def __init__(self, model, schedule="linear", controlnets=None, attn_store=None, control_stores=None, **kwargs):
         super().__init__()
         self.model = model
         self.ddpm_num_timesteps = model.num_timesteps
         self.schedule = schedule
+
+        self.controlnets = controlnets
+        self.attn_store = attn_store
+        self.control_stores = control_stores
+
+        self.const_noise = None
+        self.do_asyrp = True  # NOTE: just for test
+        # self.const_noise_scale = 0.025
 
     @property
     def torch_type(self):
@@ -24,7 +32,10 @@ class DDIMSampler(object):
                 attr = attr.to(torch.device("cuda"))
         setattr(self, name, attr)
 
-    def make_schedule(self, ddim_num_steps, ddim_discretize="uniform", ddim_eta=0., verbose=True):
+    def set_noise(self, noise):
+        self.const_noise = noise
+
+    def make_schedule(self, ddim_num_steps, ddim_discretize="uniform", ddim_eta=0., verbose=True, is_hires=False, t_enc=None):
         self.ddim_timesteps = make_ddim_timesteps(ddim_discr_method=ddim_discretize, num_ddim_timesteps=ddim_num_steps,
                                                   num_ddpm_timesteps=self.ddpm_num_timesteps,verbose=verbose)
         alphas_cumprod = self.model.alphas_cumprod
@@ -55,6 +66,9 @@ class DDIMSampler(object):
                         1 - self.alphas_cumprod / self.alphas_cumprod_prev))
         self.register_buffer('ddim_sigmas_for_original_num_steps', sigmas_for_original_sampling_steps)
 
+        if self.controlnets is not None:
+            self.controlnets.set_timesteps(self.ddim_timesteps, is_hires=is_hires, t_enc=t_enc)
+
     @torch.no_grad()
     def sample(self,
                S,
@@ -79,6 +93,8 @@ class DDIMSampler(object):
                unconditional_conditioning=None, # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
                dynamic_threshold=None,
                ucg_schedule=None,
+               img2img_tstart=None,
+               no_control=False,
                **kwargs
                ):
         if conditioning is not None:
@@ -119,7 +135,9 @@ class DDIMSampler(object):
                                                     unconditional_guidance_scale=unconditional_guidance_scale,
                                                     unconditional_conditioning=unconditional_conditioning,
                                                     dynamic_threshold=dynamic_threshold,
-                                                    ucg_schedule=ucg_schedule
+                                                    ucg_schedule=ucg_schedule,
+                                                    img2img_tstart=img2img_tstart,
+                                                    no_control=no_control,
                                                     )
         return samples, intermediates
 
@@ -130,7 +148,7 @@ class DDIMSampler(object):
                       mask=None, x0=None, img_callback=None, log_every_t=100,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
                       unconditional_guidance_scale=1., unconditional_conditioning=None, dynamic_threshold=None,
-                      ucg_schedule=None):
+                      ucg_schedule=None, img2img_tstart=None, no_control=False):
         device = self.model.betas.device
         b = shape[0]
         if x_T is None:
@@ -145,14 +163,28 @@ class DDIMSampler(object):
             subset_end = int(min(timesteps / self.ddim_timesteps.shape[0], 1) * self.ddim_timesteps.shape[0]) - 1
             timesteps = self.ddim_timesteps[:subset_end]
 
+        if img2img_tstart is not None:
+            # timesteps = timesteps[img2img_tstart:]
+            timesteps = timesteps[:img2img_tstart]
+            do_img2img = True
+        else:
+            do_img2img = False
+
         intermediates = {'x_inter': [img], 'pred_x0': [img]}
         time_range = reversed(range(0,timesteps)) if ddim_use_original_steps else np.flip(timesteps)
         total_steps = timesteps if ddim_use_original_steps else timesteps.shape[0]
-        print(f"Running DDIM Sampling with {total_steps} timesteps")
+        if do_img2img:
+            print(f"Running DDIM Sampling (img2img) with {total_steps} timesteps")
+            iterator = tqdm(time_range, desc='DDIM Sampler (img2img)', total=total_steps)
+        else:
+            print(f"Running DDIM Sampling with {total_steps} timesteps")
+            iterator = tqdm(time_range, desc='DDIM Sampler', total=total_steps)
 
-        iterator = tqdm(time_range, desc='DDIM Sampler', total=total_steps)
+        # iterator = tqdm(time_range, desc='DDIM Sampler', total=total_steps)
 
         for i, step in enumerate(iterator):
+            if do_img2img:
+                print(step)
             index = total_steps - i - 1
             ts = torch.full((b,), step, device=device, dtype=torch.long)
 
@@ -171,7 +203,7 @@ class DDIMSampler(object):
                                       corrector_kwargs=corrector_kwargs,
                                       unconditional_guidance_scale=unconditional_guidance_scale,
                                       unconditional_conditioning=unconditional_conditioning,
-                                      dynamic_threshold=dynamic_threshold)
+                                      dynamic_threshold=dynamic_threshold, no_control=no_control)
             img, pred_x0 = outs
             if callback: callback(i)
             if img_callback: img_callback(pred_x0, i)
@@ -180,13 +212,19 @@ class DDIMSampler(object):
                 intermediates['x_inter'].append(img)
                 intermediates['pred_x0'].append(pred_x0)
 
+            if self.attn_store:
+                self.attn_store.between_steps()
+            if self.control_stores:
+                for store in self.control_stores:
+                    store.between_steps()
+
         return img, intermediates
 
     @torch.no_grad()
     def p_sample_ddim(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
                       unconditional_guidance_scale=1., unconditional_conditioning=None,
-                      dynamic_threshold=None):
+                      dynamic_threshold=None, no_control=False):
         b, *_, device = *x.shape, x.device
 
         if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
@@ -213,8 +251,18 @@ class DDIMSampler(object):
                     c_in.append(torch.cat([unconditional_conditioning[i], c[i]]))
             else:
                 c_in = torch.cat([unconditional_conditioning, c])
-            model_uncond, model_t = self.model.apply_model(x_in, t_in, c_in).chunk(2)
+
+            if self.controlnets is not None:
+                control = self.controlnets(x_in, t_in, c_in)
+            else:
+                control = None
+
+            model_uncond, model_t = self.model.apply_model(x_in, t_in, c_in, control=control, no_control=no_control).chunk(2)
             model_output = model_uncond + unconditional_guidance_scale * (model_t - model_uncond)
+
+        if self.do_asyrp and not no_control:
+            model_nocontrol, model_t_nocontrol = self.model.apply_model(x_in, t_in, c_in, control=control, no_control=True).chunk(2)
+            model_nocontrol_output = model_nocontrol + unconditional_guidance_scale * (model_t_nocontrol - model_nocontrol)
 
         if self.model.parameterization == "v":
             e_t = self.model.predict_eps_from_z_and_v(x, t, model_output)
@@ -236,7 +284,9 @@ class DDIMSampler(object):
         sqrt_one_minus_at = torch.full((b, 1, 1, 1), sqrt_one_minus_alphas[index],device=device)
 
         # current prediction for x_0
-        if self.model.parameterization != "v":
+        if self.do_asyrp:  # NOTE: first-class method
+            pred_x0 = self.model.predict_start_from_z_and_v(x, t, model_nocontrol_output)
+        elif self.model.parameterization != "v":
             pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
         else:
             pred_x0 = self.model.predict_start_from_z_and_v(x, t, model_output)
@@ -252,7 +302,18 @@ class DDIMSampler(object):
         noise = sigma_t * noise_like(x.shape, device, repeat_noise) * temperature
         if noise_dropout > 0.:
             noise = torch.nn.functional.dropout(noise, p=noise_dropout)
+        if self.do_asyrp:
+            dir_xt = dir_xt * 0.05
         x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
+        print(f't: {t} mean: {x_prev.mean()} std: {x_prev.std()}')
+        # >>> Quality boosting
+        # if self.const_noise is None or self.const_noise.shape != x.shape:
+        #     self.const_noise = noise_like(x.shape, device, repeat_noise)
+        if self.const_noise is not None:
+            print(f'add const noise: N({self.const_noise.mean()}, {self.const_noise.std()})')
+            x_prev = x_prev + self.const_noise
+        # <<< boosting
+
         return x_prev, pred_x0
 
     @torch.no_grad()
@@ -320,7 +381,7 @@ class DDIMSampler(object):
 
     @torch.no_grad()
     def decode(self, x_latent, cond, t_start, unconditional_guidance_scale=1.0, unconditional_conditioning=None,
-               use_original_steps=False, callback=None):
+               use_original_steps=False, callback=None, no_control=False):
 
         timesteps = np.arange(self.ddpm_num_timesteps) if use_original_steps else self.ddim_timesteps
         timesteps = timesteps[:t_start]
@@ -336,6 +397,6 @@ class DDIMSampler(object):
             ts = torch.full((x_latent.shape[0],), step, device=x_latent.device, dtype=torch.long)
             x_dec, _ = self.p_sample_ddim(x_dec, cond, ts, index=index, use_original_steps=use_original_steps,
                                           unconditional_guidance_scale=unconditional_guidance_scale,
-                                          unconditional_conditioning=unconditional_conditioning)
+                                          unconditional_conditioning=unconditional_conditioning, no_control=no_control)
             if callback: callback(i)
         return x_dec
