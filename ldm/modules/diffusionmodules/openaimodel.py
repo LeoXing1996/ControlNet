@@ -5,6 +5,7 @@ import numpy as np
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
+from .bottel_neck_adapter import MiddleAdapter
 
 from ldm.modules.diffusionmodules.util import (
     checkpoint,
@@ -469,6 +470,9 @@ class UNetModel(nn.Module):
         num_attention_blocks=None,
         disable_middle_self_attn=False,
         use_linear_in_transformer=False,
+        ##########
+        enable_bottelneck=False,
+        ##########
     ):
         super().__init__()
         if use_spatial_transformer:
@@ -522,6 +526,8 @@ class UNetModel(nn.Module):
         self.num_head_channels = num_head_channels
         self.num_heads_upsample = num_heads_upsample
         self.predict_codebook_ids = n_embed is not None
+
+        self.adapter_dict = dict()
 
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
@@ -592,10 +598,19 @@ class UNetModel(nn.Module):
                                 use_checkpoint=use_checkpoint
                             )
                         )
+                    # if ds in bottel_neck_resolution:
+                    #     channel_list = [ch // 4, ch // 4]
+                    #     self.adapter_dict[f'in_{ds}_{ch}'] = MiddleAdapter(ch, channel_list=channel_list)
+
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
                 self._feature_size += ch
                 input_block_chans.append(ch)
             if level != len(channel_mult) - 1:
+
+                # if enable_bottelneck:
+                #     channel_list = [ch // 4, ch // 4]
+                #     self.adapter_dict[f'in_{ds}_{ch}'] = MiddleAdapter(ch, channel_list=channel_list)
+
                 out_ch = ch
                 self.input_blocks.append(
                     TimestepEmbedSequential(
@@ -619,6 +634,10 @@ class UNetModel(nn.Module):
                 input_block_chans.append(ch)
                 ds *= 2
                 self._feature_size += ch
+
+            if enable_bottelneck:
+                channel_list = [ch // 4, ch // 4]
+                self.adapter_dict[f'in_{len(self.input_blocks)-1}'] = MiddleAdapter(ch, channel_list=channel_list)
 
         if num_head_channels == -1:
             dim_head = ch // num_heads
@@ -657,6 +676,10 @@ class UNetModel(nn.Module):
                 use_scale_shift_norm=use_scale_shift_norm,
             ),
         )
+        if enable_bottelneck:
+            channel_list = [ch // 4, ch // 4]
+            self.adapter_dict['mid'] = MiddleAdapter(ch, channel_list=channel_list)
+
         self._feature_size += ch
 
         self.output_blocks = nn.ModuleList([])
@@ -703,6 +726,7 @@ class UNetModel(nn.Module):
                                 use_checkpoint=use_checkpoint
                             )
                         )
+
                 if level and i == self.num_res_blocks[level]:
                     out_ch = ch
                     layers.append(
@@ -723,6 +747,10 @@ class UNetModel(nn.Module):
                 self.output_blocks.append(TimestepEmbedSequential(*layers))
                 self._feature_size += ch
 
+            if enable_bottelneck:
+                channel_list = [ch // 4, ch // 4]
+                self.adapter_dict[f'out_{len(self.output_blocks)-1}'] = MiddleAdapter(ch, channel_list=channel_list)
+
         self.out = nn.Sequential(
             normalization(ch),
             nn.SiLU(),
@@ -734,6 +762,11 @@ class UNetModel(nn.Module):
             conv_nd(dims, model_channels, n_embed, 1),
             #nn.LogSoftmax(dim=1)  # change to cross_entropy and produce non-normalized logits
         )
+
+        if self.adapter_dict:
+            self.adapter_dict = nn.ModuleDict(self.adapter_dict)
+        if use_fp16:
+            self.to(self.dtype)
 
     def convert_to_fp16(self):
         """
@@ -760,6 +793,9 @@ class UNetModel(nn.Module):
         :param y: an [N] Tensor of labels, if class-conditional.
         :return: an [N x C x ...] Tensor of outputs.
         """
+        if self.adapter_dict:
+            return self.forward_with_adapter(x, timesteps, context, y, **kwargs)
+
         assert (y is not None) == (
             self.num_classes is not None
         ), "must specify y if and only if the model is class-conditional"
@@ -779,6 +815,52 @@ class UNetModel(nn.Module):
         for module in self.output_blocks:
             h = th.cat([h, hs.pop()], dim=1)
             h = module(h, emb, context)
+        h = h.type(x.dtype)
+        if self.predict_codebook_ids:
+            return self.id_predictor(h)
+        else:
+            return self.out(h)
+
+    def forward_with_adapter(self, x, timesteps, context=None, y=None, cond=None):
+        assert (y is not None) == (
+            self.num_classes is not None
+        ), "must specify y if and only if the model is class-conditional"
+        hs = []
+        t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
+        emb = self.time_embed(t_emb)
+
+        if self.num_classes is not None:
+            assert y.shape[0] == x.shape[0]
+            emb = emb + self.label_emb(y)
+
+        # import ipdb
+        # ipdb.set_trace()
+        h = x.type(self.dtype)
+        # for module in self.input_blocks:
+        #     for sub_module in module:
+        #         h = sub_module(h, emb, context)
+        #         ch = h.shape[1]
+        #         ds = h.shape[-1]
+        #         if f'in_{ds}_{ch}' in self.adapter_dict:
+        #             h = self.adapter_dict[f'in_{ds}_{ch}'](h, cond)
+        #     hs.append(h)
+
+        for index, module in enumerate(self.input_blocks):
+            h = module(h, emb, context)
+            if f'in_{index}' in self.adapter_dict:
+                print(f'in_{index}')
+                h = self.adapter_dict[f'in_{index}'](h, cond)
+            hs.append(h)
+
+        # TODO: maybe we should add operation for middle layer?
+        h = self.middle_block(h, emb, context)
+
+        for index, module in enumerate(self.output_blocks):
+            h = th.cat([h, hs.pop()], dim=1)
+            h = module(h, emb, context)
+            if f'out_{index}' in self.adapter_dict:
+                h = self.adapter_dict[f'out_{index}'](h, cond)
+
         h = h.type(x.dtype)
         if self.predict_codebook_ids:
             return self.id_predictor(h)
